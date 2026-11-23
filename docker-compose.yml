@@ -1,0 +1,132 @@
+# Local stack: Flink (JobManager + TaskManager), Postgres, ClickHouse.
+#
+# Design notes (learned the hard way elsewhere):
+#  * Logging is json-file, NON-BLOCKING and size-capped. A blocking log driver whose backend is down
+#    can wedge a chatty process on write(); `restart: unless-stopped` can't fix a hang (only exits).
+#  * Healthchecks gate startup ordering (depends_on: service_healthy) but do not self-heal hangs.
+#  * Named volumes hold ALL state (db data, checkpoints, savepoints). `docker compose down` keeps them;
+#    only scripts/down.sh --purge deletes them (after a typed confirmation).
+#  * Every published port is bound to 127.0.0.1.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    mode: non-blocking
+    max-buffer-size: 4m
+    max-size: 20m
+    max-file: "3"
+
+x-app-env: &app-env
+  PG_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+  PG_USER: ${POSTGRES_USER}
+  PG_PASSWORD: ${POSTGRES_PASSWORD}
+  CH_URL: jdbc:clickhouse://clickhouse:8123/${CLICKHOUSE_DB}
+  CH_USER: ${CLICKHOUSE_USER}
+  CH_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  EVENTS_PER_SECOND: ${EVENTS_PER_SECOND:-200}
+  NUM_USERS: ${NUM_USERS:-50}
+  WINDOW_SECONDS: ${WINDOW_SECONDS:-10}
+  CHECKPOINT_INTERVAL_MS: ${CHECKPOINT_INTERVAL_MS:-10000}
+  JDBC_BATCH_SIZE: ${JDBC_BATCH_SIZE:-1000}
+  JDBC_BATCH_INTERVAL_MS: ${JDBC_BATCH_INTERVAL_MS:-1000}
+
+x-flink-properties: &flink-properties |
+  jobmanager.rpc.address: jobmanager
+  jobmanager.memory.process.size: ${JM_MEMORY:-1024m}
+  taskmanager.memory.process.size: ${TM_MEMORY:-1728m}
+  taskmanager.numberOfTaskSlots: ${TM_SLOTS:-2}
+  state.backend.type: hashmap
+  state.checkpoints.dir: file:///opt/flink/checkpoints
+  state.savepoints.dir: file:///opt/flink/savepoints
+  execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+  state.checkpoints.num-retained: 3
+  heartbeat.timeout: 60000
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 30s
+    logging: *logging
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "127.0.0.1:${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./docker/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    stop_grace_period: 30s
+    logging: *logging
+
+  jobmanager:
+    build: ./docker/flink
+    image: flink-template-flink:1.20.1
+    restart: unless-stopped
+    command: jobmanager
+    ports: ["127.0.0.1:${FLINK_UI_PORT:-8081}:8081"]
+    environment:
+      FLINK_PROPERTIES: *flink-properties
+      <<: *app-env
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
+      - ./artifacts:/opt/flink/jobs:ro   # job.jar is submitted from here (NOT usrlib: that's classpath)
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8081'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      postgres: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    stop_grace_period: 60s
+    logging: *logging
+
+  taskmanager:
+    image: flink-template-flink:1.20.1
+    restart: unless-stopped
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: *flink-properties
+      <<: *app-env
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
+    depends_on:
+      jobmanager: {condition: service_healthy}
+    stop_grace_period: 60s
+    logging: *logging
+
+volumes:
+  pg-data:
+  ch-data:
+  flink-checkpoints:
+  flink-savepoints:

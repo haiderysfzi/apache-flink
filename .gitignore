@@ -1,0 +1,10 @@
+.env
+target/
+artifacts/*.jar
+.state/*
+!.state/.gitkeep
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.bak.*
